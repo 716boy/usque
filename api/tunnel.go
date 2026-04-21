@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -156,6 +157,17 @@ type MaintainTunnelConfig struct {
 	UseHTTP2          bool
 }
 
+// pumpShutdownGrace is how long the reconnect logic waits for the previous
+// pair of pump goroutines to exit before starting a new pair. Closing the
+// IP-side connection synchronously unblocks the IP→device pump immediately.
+// The device→IP pump can still be parked inside a TUN read; we cap the
+// wait so we don't deadlock the supervisor, and rely on the next packet
+// (which will then fail to write to the now-closed connection) to drain
+// the stale goroutine on its own. The mutex around device reads (see
+// pumpDeviceToIP) prevents the new and stale device readers from racing
+// for the same packet during that brief overlap.
+const pumpShutdownGrace = 5 * time.Second
+
 // MaintainTunnel continuously connects to the MASQUE server, then starts two
 // forwarding goroutines: one forwarding from the device to the IP connection (and handling
 // any ICMP reply), and the other forwarding from the IP connection to the device.
@@ -177,11 +189,26 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 
 	packetBufferPool := NewNetBuffer(cfg.MTU)
 
+	// deviceReadMu serializes ReadPacket calls on cfg.Device across the
+	// (possibly transient) overlap between an old, draining pump goroutine
+	// and the freshly-spawned one for the next session. Without this, a
+	// stale device reader could steal a packet from the new session and
+	// then fail to write it to the closed IP connection, dropping that
+	// packet entirely.
+	var deviceReadMu sync.Mutex
+
 	for {
+		if ctx.Err() != nil {
+			log.Printf("MaintainTunnel: context cancelled, exiting: %v", ctx.Err())
+			return
+		}
+
 		if !cfg.AlwaysReconnect {
 			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
 			buf := packetBufferPool.Get()
+			deviceReadMu.Lock()
 			n, err := cfg.Device.ReadPacket(buf)
+			deviceReadMu.Unlock()
 			if err != nil {
 				packetBufferPool.Put(buf)
 				log.Printf("Failed to read from TUN device while waiting for activity: %v", err)
@@ -202,93 +229,238 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			cfg.UseHTTP2,
 		)
 		if err != nil {
+			// Bug 2 fix: ConnectTunnel may return partially-allocated
+			// resources (e.g. the UDP socket) alongside the error. The
+			// previous version logged the error and continued, leaking
+			// the file descriptors on every failed reconnect attempt
+			// until the process eventually hit ulimit.
+			closeIfNotNil(ipConn, udpConn, tr)
 			log.Printf("Failed to connect tunnel: %v", err)
-			time.Sleep(cfg.ReconnectDelay)
+			sleepOrCancel(ctx, cfg.ReconnectDelay)
 			continue
 		}
-		if rsp.StatusCode != 200 {
+		if rsp != nil && rsp.StatusCode != 200 {
 			log.Printf("Tunnel connection failed: %s", rsp.Status)
-			ipConn.Close()
-			if udpConn != nil {
-				udpConn.Close()
-			}
-			if tr != nil {
-				tr.Close()
-			}
-			time.Sleep(cfg.ReconnectDelay)
+			closeIfNotNil(ipConn, udpConn, tr)
+			sleepOrCancel(ctx, cfg.ReconnectDelay)
 			continue
 		}
 
 		log.Println("Connected to MASQUE server")
 
+		// Bug 1 fix: previously the supervisor used a buffered errChan
+		// and only read one error before reconnecting, leaving the
+		// peer goroutine alive. After several reconnects, multiple
+		// stale goroutines were racing for the same TUN device and IP
+		// connection, dropping packets and corrupting state. We now
+		// gate every reconnect on a WaitGroup so the previous pair has
+		// exited (or the grace window expired) before the next pair
+		// is spawned.
+		pumpCtx, pumpCancel := context.WithCancel(ctx)
 		errChan := make(chan error, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
 
-		go func() {
-			for {
-				buf := packetBufferPool.Get()
-				n, err := cfg.Device.ReadPacket(buf)
-				if err != nil {
-					packetBufferPool.Put(buf)
-					errChan <- fmt.Errorf("failed to read from TUN device: %w", err)
-					return
-				}
-				icmp, err := ipConn.WritePacket(buf[:n])
-				if err != nil {
-					packetBufferPool.Put(buf)
-					if errors.As(err, new(*connectip.CloseError)) {
-						errChan <- fmt.Errorf("connection closed while writing to IP connection: %w", err)
-						return
-					}
-					log.Printf("Error writing to IP connection: %v, continuing...", err)
-					continue
-				}
-				packetBufferPool.Put(buf)
-
-				if len(icmp) > 0 {
-					if err := cfg.Device.WritePacket(icmp); err != nil {
-						if errors.As(err, new(*connectip.CloseError)) {
-							errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %w", err)
-							return
-						}
-						log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
-					}
-				}
-			}
-		}()
-
-		go func() {
-			buf := packetBufferPool.Get()
-			defer packetBufferPool.Put(buf)
-			for {
-				n, err := ipConn.ReadPacket(buf, true)
-				if err != nil {
-					if cfg.UseHTTP2 {
-						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
-						return
-					}
-					if errors.As(err, new(*connectip.CloseError)) {
-						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
-						return
-					}
-					log.Printf("Error reading from IP connection: %v, continuing...", err)
-					continue
-				}
-				if err := cfg.Device.WritePacket(buf[:n]); err != nil {
-					errChan <- fmt.Errorf("failed to write to TUN device: %w", err)
-					return
-				}
-			}
-		}()
+		go pumpDeviceToIP(pumpCtx, &wg, errChan, cfg.Device, ipConn, packetBufferPool, &deviceReadMu)
+		go pumpIPToDevice(pumpCtx, &wg, errChan, cfg.Device, ipConn, packetBufferPool, cfg.UseHTTP2)
 
 		err = <-errChan
 		log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
-		ipConn.Close()
-		if udpConn != nil {
-			udpConn.Close()
+
+		// Cancel the pump context first so any select-aware code paths
+		// stop early, then close the IP connection to unblock the
+		// IP→device pump's blocking read/write. The device→IP pump
+		// will exit either when its current TUN read returns (and the
+		// subsequent IP write fails) or, if the device is idle, when
+		// the grace window expires.
+		pumpCancel()
+		closeIfNotNil(ipConn, udpConn, tr)
+		waitForPumps(&wg, pumpShutdownGrace)
+
+		sleepOrCancel(ctx, cfg.ReconnectDelay)
+	}
+}
+
+// pumpDeviceToIP forwards packets from the TUN device to the MASQUE IP
+// connection and writes any synchronous ICMP reply back to the device.
+// It signals exit via errChan and the WaitGroup; it always sends exactly
+// one value to errChan so the supervisor can select on it.
+func pumpDeviceToIP(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	errChan chan<- error,
+	device TunnelDevice,
+	ipConn *connectip.Conn,
+	pool *NetBuffer,
+	deviceReadMu *sync.Mutex,
+) {
+	defer wg.Done()
+	sent := false
+	send := func(err error) {
+		if sent {
+			return
 		}
-		if tr != nil {
-			tr.Close()
+		sent = true
+		select {
+		case errChan <- err:
+		default:
+			// Buffer is full because the peer goroutine already
+			// reported an error. Nothing to do.
 		}
-		time.Sleep(cfg.ReconnectDelay)
+	}
+
+	for {
+		if ctx.Err() != nil {
+			send(fmt.Errorf("device→ip pump: context cancelled: %w", ctx.Err()))
+			return
+		}
+
+		buf := pool.Get()
+
+		deviceReadMu.Lock()
+		n, err := device.ReadPacket(buf)
+		deviceReadMu.Unlock()
+		if err != nil {
+			pool.Put(buf)
+			send(fmt.Errorf("failed to read from TUN device: %w", err))
+			return
+		}
+
+		// If we were cancelled while parked in ReadPacket, drop the
+		// packet rather than write to a connection the supervisor
+		// already closed.
+		if ctx.Err() != nil {
+			pool.Put(buf)
+			send(fmt.Errorf("device→ip pump: context cancelled after read: %w", ctx.Err()))
+			return
+		}
+
+		icmp, err := ipConn.WritePacket(buf[:n])
+		if err != nil {
+			pool.Put(buf)
+			if errors.As(err, new(*connectip.CloseError)) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+				send(fmt.Errorf("connection closed while writing to IP connection: %w", err))
+				return
+			}
+			log.Printf("Error writing to IP connection: %v, continuing...", err)
+			continue
+		}
+		pool.Put(buf)
+
+		if len(icmp) > 0 {
+			if err := device.WritePacket(icmp); err != nil {
+				if errors.As(err, new(*connectip.CloseError)) || errors.Is(err, net.ErrClosed) {
+					send(fmt.Errorf("connection closed while writing ICMP to TUN device: %w", err))
+					return
+				}
+				log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
+			}
+		}
+	}
+}
+
+// pumpIPToDevice forwards packets from the MASQUE IP connection to the TUN
+// device. It uses a single owned buffer for the lifetime of the goroutine
+// (the underlying ReadPacket fills the same scratch on every call). It
+// signals exit via errChan and the WaitGroup.
+func pumpIPToDevice(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	errChan chan<- error,
+	device TunnelDevice,
+	ipConn *connectip.Conn,
+	pool *NetBuffer,
+	useHTTP2 bool,
+) {
+	defer wg.Done()
+	buf := pool.Get()
+	defer pool.Put(buf)
+
+	sent := false
+	send := func(err error) {
+		if sent {
+			return
+		}
+		sent = true
+		select {
+		case errChan <- err:
+		default:
+		}
+	}
+
+	for {
+		if ctx.Err() != nil {
+			send(fmt.Errorf("ip→device pump: context cancelled: %w", ctx.Err()))
+			return
+		}
+
+		n, err := ipConn.ReadPacket(buf, true)
+		if err != nil {
+			if useHTTP2 {
+				send(fmt.Errorf("connection closed while reading from IP connection: %w", err))
+				return
+			}
+			if errors.As(err, new(*connectip.CloseError)) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+				send(fmt.Errorf("connection closed while reading from IP connection: %w", err))
+				return
+			}
+			log.Printf("Error reading from IP connection: %v, continuing...", err)
+			continue
+		}
+		if err := device.WritePacket(buf[:n]); err != nil {
+			send(fmt.Errorf("failed to write to TUN device: %w", err))
+			return
+		}
+	}
+}
+
+// waitForPumps blocks until both pump goroutines exit, or until grace
+// elapses. A timeout is logged but not fatal: the stale goroutine will
+// notice the closed IP connection on its next operation and exit on its
+// own. Returning here lets the supervisor proceed with the next reconnect
+// even if a TUN read is parked for a long time.
+func waitForPumps(wg *sync.WaitGroup, grace time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return
+	case <-time.After(grace):
+		log.Printf("Tunnel pump did not exit within %s; continuing reconnect (stale goroutine will drain on next packet)", grace)
+	}
+}
+
+// sleepOrCancel waits for d or until ctx is done, whichever comes first.
+// Replaces the bare time.Sleep that previously made the reconnect loop
+// unresponsive to context cancellation.
+func sleepOrCancel(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
+// closeIfNotNil closes a heterogeneous set of optional resources in a
+// fixed order (IP connection first, so any blocked reads on the underlying
+// transport unblock before we drop their owner) and ignores Close errors
+// because we are already on an error path.
+func closeIfNotNil(ipConn *connectip.Conn, udpConn *net.UDPConn, tr io.Closer) {
+	if ipConn != nil {
+		_ = ipConn.Close()
+	}
+	if tr != nil {
+		_ = tr.Close()
+	}
+	if udpConn != nil {
+		_ = udpConn.Close()
 	}
 }
