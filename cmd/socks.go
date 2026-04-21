@@ -19,7 +19,7 @@ import (
 var socksCmd = &cobra.Command{
 	Use:   "socks",
 	Short: "Expose Warp as a SOCKS5 proxy",
-	Long:  "Dual-stack SOCKS5 proxy with optional authentication. Doesn't require elevated privileges.",
+	Long:  "Dual-stack SOCKS5 proxy with optional authentication. Doesn't require elevated privileges. Listens on 127.0.0.1 by default; bind to 0.0.0.0 only with explicit --bind 0.0.0.0 and authentication.",
 	Run: func(cmd *cobra.Command, args []string) {
 		if !config.ConfigLoaded {
 			cmd.Println("Config not loaded. Please register first.")
@@ -49,13 +49,7 @@ var socksCmd = &cobra.Command{
 			return
 		}
 
-		insecure, err := cmd.Flags().GetBool("insecure")
-		if err != nil {
-			cmd.Printf("Failed to get insecure flag: %v\n", err)
-			return
-		}
-
-		tlsConfig, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, sni, insecure)
+		tlsConfig, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, sni)
 		if err != nil {
 			cmd.Printf("Failed to prepare TLS config: %v\n", err)
 			return
@@ -106,10 +100,6 @@ var socksCmd = &cobra.Command{
 		if err != nil {
 			cmd.Printf("Failed to select endpoint: %v\n", err)
 			return
-		}
-
-		if insecure {
-			config.WarnInsecure()
 		}
 
 		if useHTTP2 {
@@ -192,6 +182,20 @@ var socksCmd = &cobra.Command{
 			password = p
 		}
 
+		allowPrivate, err := cmd.Flags().GetBool("allow-private-destinations")
+		if err != nil {
+			cmd.Printf("Failed to get allow-private-destinations flag: %v\n", err)
+			return
+		}
+
+		// Refuse to bind to a non-loopback address without authentication.
+		// This prevents the proxy from acting as an open relay for the WARP
+		// tunnel when an operator accidentally exposes it to the LAN.
+		if !isLoopbackBind(bindAddress) && (username == "" || password == "") {
+			cmd.Printf("Refusing to bind SOCKS proxy to %q without --username and --password set. Bind to 127.0.0.1 (default) or supply credentials.\n", bindAddress)
+			return
+		}
+
 		reconnectDelay, err := cmd.Flags().GetDuration("reconnect-delay")
 		if err != nil {
 			cmd.Printf("Failed to get reconnect delay: %v\n", err)
@@ -230,21 +234,31 @@ var socksCmd = &cobra.Command{
 			resolver = internal.TunnelDNSResolver{TunNet: tunNet, DNSAddrs: dnsAddrs, Timeout: dnsTimeout}
 		}
 
+		// dialFn enforces the destination block-list on the resolved IP
+		// before tunneling the connection. SOCKS clients can hand us either
+		// a hostname or a numeric address; the resolver will already have
+		// rewritten hostnames to addresses for us by the time we get here.
+		dialFn := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				if ip := net.ParseIP(host); ip != nil && internal.IsBlockedIP(ip) && !allowPrivate {
+					return nil, internal.ErrBlockedDestination
+				}
+			}
+			return tunNet.DialContext(ctx, network, addr)
+		}
+
 		var server *socks5.Server
 		if username == "" || password == "" {
 			server = socks5.NewServer(
 				socks5.WithLogger(socks5.NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
-				socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return tunNet.DialContext(ctx, network, addr)
-				}),
+				socks5.WithDial(dialFn),
 				socks5.WithResolver(resolver),
 			)
 		} else {
 			server = socks5.NewServer(
 				socks5.WithLogger(socks5.NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
-				socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return tunNet.DialContext(ctx, network, addr)
-				}),
+				socks5.WithDial(dialFn),
 				socks5.WithResolver(resolver),
 				socks5.WithAuthMethods(
 					[]socks5.Authenticator{
@@ -266,11 +280,25 @@ var socksCmd = &cobra.Command{
 	},
 }
 
+// isLoopbackBind reports whether the given bind address is a loopback
+// literal. Hostnames other than "localhost" are conservatively treated as
+// non-loopback.
+func isLoopbackBind(bind string) bool {
+	switch bind {
+	case "", "localhost", "127.0.0.1", "::1", "[::1]":
+		return true
+	}
+	if ip := net.ParseIP(bind); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 func init() {
-	socksCmd.Flags().StringP("bind", "b", "0.0.0.0", "Address to bind the SOCKS proxy to")
+	socksCmd.Flags().StringP("bind", "b", "127.0.0.1", "Address to bind the SOCKS proxy to (default loopback; binding to a non-loopback address requires --username/--password)")
 	socksCmd.Flags().StringP("port", "p", "1080", "Port to listen on for SOCKS proxy")
-	socksCmd.Flags().StringP("username", "u", "", "Username for proxy authentication (specify both username and password to enable)")
-	socksCmd.Flags().StringP("password", "w", "", "Password for proxy authentication (specify both username and password to enable)")
+	socksCmd.Flags().StringP("username", "u", "", "Username for proxy authentication (required when binding to a non-loopback address)")
+	socksCmd.Flags().StringP("password", "w", "", "Password for proxy authentication (required when binding to a non-loopback address)")
 	socksCmd.Flags().IntP("connect-port", "P", 443, "Used port for MASQUE connection")
 	socksCmd.Flags().StringArrayP("dns", "d", []string{"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"}, "DNS servers to use")
 	socksCmd.Flags().DurationP("dns-timeout", "t", 2*time.Second, "Timeout for DNS queries")
@@ -284,7 +312,7 @@ func init() {
 	socksCmd.Flags().DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
 	socksCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
 	socksCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
-	socksCmd.Flags().Bool("insecure", false, "Disable endpoint certificate pinning and trust any certificate")
 	socksCmd.Flags().BoolP("local-dns", "l", false, "Don't use the tunnel for DNS queries")
+	socksCmd.Flags().Bool("allow-private-destinations", false, "Allow proxying to loopback/private/link-local/multicast destinations (off by default to prevent SSRF)")
 	rootCmd.AddCommand(socksCmd)
 }
