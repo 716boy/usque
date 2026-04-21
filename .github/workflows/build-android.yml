@@ -2,9 +2,9 @@ name: build-android-arm64
 
 on:
   push:
-    branches: ['**']
+    branches: [ "main", "tests" ]
   pull_request:
-    branches: ['**']
+    branches: [ "main", "tests" ]
   workflow_dispatch: {}
 
 permissions:
