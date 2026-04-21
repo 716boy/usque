@@ -20,7 +20,7 @@ import (
 var httpProxyCmd = &cobra.Command{
 	Use:   "http-proxy",
 	Short: "Expose Warp as an HTTP proxy with CONNECT support",
-	Long:  "Dual-stack HTTP proxy with CONNECT support. Doesn't require elevated privileges.",
+	Long:  "Dual-stack HTTP proxy with CONNECT support. Doesn't require elevated privileges. Listens on 127.0.0.1 by default; bind to a non-loopback address only with --username/--password.",
 	Run: func(cmd *cobra.Command, args []string) {
 		if !config.ConfigLoaded {
 			cmd.Println("Config not loaded. Please register first.")
@@ -50,13 +50,7 @@ var httpProxyCmd = &cobra.Command{
 			return
 		}
 
-		insecure, err := cmd.Flags().GetBool("insecure")
-		if err != nil {
-			cmd.Printf("Failed to get insecure flag: %v\n", err)
-			return
-		}
-
-		tlsConfig, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, sni, insecure)
+		tlsConfig, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, sni)
 		if err != nil {
 			cmd.Printf("Failed to prepare TLS config: %v\n", err)
 			return
@@ -107,10 +101,6 @@ var httpProxyCmd = &cobra.Command{
 		if err != nil {
 			cmd.Printf("Failed to select endpoint: %v\n", err)
 			return
-		}
-
-		if insecure {
-			config.WarnInsecure()
 		}
 
 		if useHTTP2 {
@@ -193,6 +183,18 @@ var httpProxyCmd = &cobra.Command{
 			password = p
 		}
 
+		allowPrivate, err := cmd.Flags().GetBool("allow-private-destinations")
+		if err != nil {
+			cmd.Printf("Failed to get allow-private-destinations flag: %v\n", err)
+			return
+		}
+
+		// Refuse to bind to a non-loopback address without authentication.
+		if !isLoopbackBind(bindAddress) && (username == "" || password == "") {
+			cmd.Printf("Refusing to bind HTTP proxy to %q without --username and --password set. Bind to 127.0.0.1 (default) or supply credentials.\n", bindAddress)
+			return
+		}
+
 		reconnectDelay, err := cmd.Flags().GetDuration("reconnect-delay")
 		if err != nil {
 			cmd.Printf("Failed to get reconnect delay: %v\n", err)
@@ -241,9 +243,9 @@ var httpProxyCmd = &cobra.Command{
 				}
 
 				if r.Method == http.MethodConnect {
-					handleHTTPSConnect(w, r, tunNet, resolver)
+					handleHTTPSConnect(w, r, tunNet, resolver, allowPrivate)
 				} else {
-					handleHTTPProxy(w, r, tunNet, resolver)
+					handleHTTPProxy(w, r, tunNet, resolver, allowPrivate)
 				}
 			}),
 		}
@@ -275,7 +277,8 @@ func authenticate(r *http.Request, expectedAuth string) bool {
 //   - r: *http.Request - The incoming HTTP request.
 //   - tunNet: *netstack.Net - The netstack network interface.
 //   - resolver: *net.Resolver - The DNS resolver to use for the tunnel.
-func handleHTTPSConnect(w http.ResponseWriter, r *http.Request, tunNet *netstack.Net, resolver *net.Resolver) {
+//   - allowPrivate: bool - When true, skip the destination block-list check.
+func handleHTTPSConnect(w http.ResponseWriter, r *http.Request, tunNet *netstack.Net, resolver *net.Resolver, allowPrivate bool) {
 	ctx := r.Context()
 
 	host, port, err := net.SplitHostPort(r.Host)
@@ -284,11 +287,22 @@ func handleHTTPSConnect(w http.ResponseWriter, r *http.Request, tunNet *netstack
 		return
 	}
 
+	if err := internal.CheckHostAllowed(ctx, host, resolver, allowPrivate); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
 	var destAddr string
 	if resolver != nil {
 		ips, err := resolver.LookupIP(ctx, "ip", host)
 		if err != nil || len(ips) == 0 {
 			http.Error(w, "DNS resolution failed", http.StatusServiceUnavailable)
+			return
+		}
+		// Re-check the resolved IP in case CheckHostAllowed received a
+		// hostname and the resolver returned a different set this time.
+		if !allowPrivate && internal.IsBlockedIP(ips[0]) {
+			http.Error(w, internal.ErrBlockedDestination.Error(), http.StatusForbidden)
 			return
 		}
 		destAddr = net.JoinHostPort(ips[0].String(), port)
@@ -338,10 +352,16 @@ func handleHTTPSConnect(w http.ResponseWriter, r *http.Request, tunNet *netstack
 //   - r: *http.Request - The incoming HTTP request.
 //   - tunNet: *netstack.Net - The netstack network interface.
 //   - resolver: *net.Resolver - The DNS resolver to use for the tunnel.
-func handleHTTPProxy(w http.ResponseWriter, r *http.Request, tunNet *netstack.Net, resolver *net.Resolver) {
+//   - allowPrivate: bool - When true, skip the destination block-list check.
+func handleHTTPProxy(w http.ResponseWriter, r *http.Request, tunNet *netstack.Net, resolver *net.Resolver, allowPrivate bool) {
 	port := r.URL.Port()
 	if port == "" {
 		port = "80"
+	}
+
+	if err := internal.CheckHostAllowed(r.Context(), r.URL.Hostname(), resolver, allowPrivate); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
 	}
 
 	client := &http.Client{
@@ -358,8 +378,16 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, tunNet *netstack.Ne
 					if err != nil || len(ips) == 0 {
 						return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
 					}
+					if !allowPrivate && internal.IsBlockedIP(ips[0]) {
+						return nil, internal.ErrBlockedDestination
+					}
 					dialAddr = net.JoinHostPort(ips[0].String(), port)
 				} else {
+					if !allowPrivate {
+						if ip := net.ParseIP(host); ip != nil && internal.IsBlockedIP(ip) {
+							return nil, internal.ErrBlockedDestination
+						}
+					}
 					dialAddr = addr
 				}
 
@@ -401,10 +429,10 @@ func copyHeader(dst, src http.Header) {
 }
 
 func init() {
-	httpProxyCmd.Flags().StringP("bind", "b", "0.0.0.0", "Address to bind the HTTP proxy to")
+	httpProxyCmd.Flags().StringP("bind", "b", "127.0.0.1", "Address to bind the HTTP proxy to (default loopback; binding to a non-loopback address requires --username/--password)")
 	httpProxyCmd.Flags().StringP("port", "p", "8000", "Port to listen on for HTTP proxy")
-	httpProxyCmd.Flags().StringP("username", "u", "", "Username for proxy authentication (specify both username and password to enable)")
-	httpProxyCmd.Flags().StringP("password", "w", "", "Password for proxy authentication (specify both username and password to enable)")
+	httpProxyCmd.Flags().StringP("username", "u", "", "Username for proxy authentication (required when binding to a non-loopback address)")
+	httpProxyCmd.Flags().StringP("password", "w", "", "Password for proxy authentication (required when binding to a non-loopback address)")
 	httpProxyCmd.Flags().IntP("connect-port", "P", 443, "Used port for MASQUE connection")
 	httpProxyCmd.Flags().StringArrayP("dns", "d", []string{"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"}, "DNS servers to use")
 	httpProxyCmd.Flags().DurationP("dns-timeout", "t", 2*time.Second, "Timeout for DNS queries")
@@ -418,7 +446,7 @@ func init() {
 	httpProxyCmd.Flags().DurationP("reconnect-delay", "r", 1*time.Second, "Delay between reconnect attempts")
 	httpProxyCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
 	httpProxyCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
-	httpProxyCmd.Flags().Bool("insecure", false, "Disable endpoint certificate pinning and trust any certificate")
 	httpProxyCmd.Flags().BoolP("local-dns", "l", false, "Don't use the tunnel for DNS queries")
+	httpProxyCmd.Flags().Bool("allow-private-destinations", false, "Allow proxying to loopback/private/link-local/multicast destinations (off by default to prevent SSRF)")
 	rootCmd.AddCommand(httpProxyCmd)
 }
